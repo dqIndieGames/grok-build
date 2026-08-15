@@ -864,7 +864,7 @@ async fn rate_limit_exhausts_at_threshold_and_yields_failed() {
     }
 
     let hits = counter.load(Ordering::SeqCst);
-    // RATE_LIMIT_RETRY_THRESHOLD = 2, so the actor stops after two
+    // SamplerConfig.max_retries = Some(2), so the actor stops after two
     // attempts (the first attempt + one retry that also 429s = 2
     // hits). Allow a small slack in case scheduling fires a third
     // attempt before the threshold check.

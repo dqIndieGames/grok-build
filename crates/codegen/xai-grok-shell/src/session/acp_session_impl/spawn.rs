@@ -1145,8 +1145,8 @@ pub(crate) async fn spawn_session_actor(
         sampler_config_initial.doom_loop_recovery = None;
     }
     let sampler_retry_policy = xai_grok_sampler::RetryPolicy {
-        max_retries: max_retries.unwrap_or(5),
-        rate_limit_retry_threshold: 2,
+        max_retries: xai_grok_sampler::resolve_max_retries(max_retries),
+        rate_limit_retry_threshold: xai_grok_sampler::RATE_LIMIT_RETRY_THRESHOLD,
         retry_only_before_output,
     };
     let (sampler_event_tx, sampler_event_rx) =

@@ -3956,7 +3956,7 @@ pub struct ModelEntryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference_idle_timeout_secs: Option<u64>,
     /// Maximum number of retries for transient API errors (429, 500, 502, etc.)
-    /// during a single inference request. Default: 5.
+    /// during a single inference request. Default: 1_000_000.
     /// Can also be set via the `GROK_MAX_RETRIES` environment variable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,

@@ -1,0 +1,104 @@
+name: Build grok
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-grok-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  test-linux:
+    name: Linux sampler tests + compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Export PROTOC
+        run: echo "PROTOC=$(command -v protoc)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Sampler unit tests
+        run: cargo test -p xai-grok-sampler --lib
+
+      - name: Release binary
+        run: cargo build -p xai-grok-pager-bin --release
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp target/release/xai-grok-pager dist/grok
+          chmod +x dist/grok
+          ls -lh dist/grok
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grok-linux-x86_64
+          path: dist/grok
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows grok.exe
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Export PROTOC
+        shell: pwsh
+        run: |
+          $p = (Get-Command protoc).Source
+          "PROTOC=$p" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "PROTOC=$p"
+          & $p --version
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Release binary
+        run: cargo build -p xai-grok-pager-bin --release
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/xai-grok-pager.exe dist/grok.exe
+          Get-Item dist/grok.exe | Format-List FullName, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grok-windows-x86_64
+          path: dist/grok.exe
+          if-no-files-found: error

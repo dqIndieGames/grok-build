@@ -195,7 +195,7 @@ pub struct RetryPolicy {
     /// Maximum number of retries before giving up.
     pub max_retries: u32,
     /// After this many rate-limit (429) retries, escalate to the caller.
-    /// Lower than `max_retries` because rate-limit waits can be long.
+    /// Equal to `max_retries` in the default policy so 429 uses the same budget.
     pub rate_limit_retry_threshold: u32,
     #[serde(default)]
     pub retry_only_before_output: bool,
