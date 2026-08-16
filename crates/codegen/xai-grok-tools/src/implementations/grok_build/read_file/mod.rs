@@ -1775,9 +1775,7 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
             "3-line window on 11-line file should be truncated"
         );
     }
-    use crate::implementations::read_file::image::{
-        MAX_IMAGE_DIMENSION, MAX_IMAGE_PAYLOAD_BYTES, MAX_IMAGE_RAW_BYTES,
-    };
+    use crate::implementations::read_file::image::MAX_IMAGE_PAYLOAD_BYTES;
     /// Creates a PNG with pseudo-random pixel data so it doesn't compress
     /// into a trivially small file (unlike a solid-color or gradient image).
     fn make_noisy_png(width: u32, height: u32) -> Vec<u8> {
@@ -1810,56 +1808,32 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
         assert_eq!(mime, "image/png");
     }
     #[test]
-    fn compress_large_noisy_image_picks_jpeg() {
+    fn compress_large_noisy_png_stays_png_and_fits_high() {
         let png = make_noisy_png(2048, 1536);
-        let b64_before = (png.len() * 4).div_ceil(3);
-        assert!(
-            b64_before > MAX_IMAGE_PAYLOAD_BYTES,
-            "test image ({b64_before} B b64) must exceed the payload limit"
-        );
         let (result, mime) = compress_image_for_conversation(png, "image/png".into()).unwrap();
-        assert_eq!(mime, "image/jpeg");
-        let b64_after = (result.len() * 4).div_ceil(3);
-        assert!(
-            b64_after <= MAX_IMAGE_PAYLOAD_BYTES,
-            "compressed image ({b64_after} B b64) must fit within {MAX_IMAGE_PAYLOAD_BYTES} B"
-        );
+        assert_eq!(mime, "image/png");
+        let decoded = image::load_from_memory(&result).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1824, 1368));
     }
     #[test]
-    fn compress_flat_color_picks_png() {
+    fn compress_flat_color_over_high_stays_png() {
         use image::{ImageBuffer, Rgba};
-        let img = ImageBuffer::from_pixel(1024u32, 768, Rgba([40u8, 80, 120, 255]));
+        let img = ImageBuffer::from_pixel(4000u32, 4000, Rgba([40u8, 80, 120, 255]));
         let mut png_buf = std::io::Cursor::new(Vec::new());
         img.write_to(&mut png_buf, image::ImageFormat::Png).unwrap();
-        let mut raw = png_buf.into_inner();
-        let target_raw = MAX_IMAGE_RAW_BYTES + 1;
-        if raw.len() < target_raw {
-            raw.resize(target_raw, 0xAA);
-        }
-        let b64_size = (raw.len() * 4).div_ceil(3);
-        assert!(
-            b64_size > MAX_IMAGE_PAYLOAD_BYTES,
-            "test image ({b64_size} B b64) must exceed the payload limit"
-        );
+        let raw = png_buf.into_inner();
         let (result, mime) = compress_image_for_conversation(raw, "image/png".into()).unwrap();
-        assert_eq!(
-            mime, "image/png",
-            "flat-color image should pick PNG over JPEG"
-        );
-        let b64_after = (result.len() * 4).div_ceil(3);
-        assert!(
-            b64_after <= MAX_IMAGE_PAYLOAD_BYTES,
-            "compressed image ({b64_after} B b64) must fit within {MAX_IMAGE_PAYLOAD_BYTES} B"
-        );
+        assert_eq!(mime, "image/png");
+        let decoded = image::load_from_memory(&result).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1600, 1600));
     }
     #[test]
     fn compress_oversized_image_preserves_aspect_ratio() {
         let png = make_noisy_png(3000, 2000);
         let (result, mime) = compress_image_for_conversation(png, "image/png".into()).unwrap();
-        assert_eq!(mime, "image/jpeg");
+        assert_eq!(mime, "image/png");
         let decoded = image::load_from_memory(&result).unwrap();
-        assert!(decoded.width() <= MAX_IMAGE_DIMENSION);
-        assert!(decoded.height() <= MAX_IMAGE_DIMENSION);
+        assert_eq!((decoded.width(), decoded.height()), (1920, 1280));
         let ratio = decoded.width() as f64 / decoded.height() as f64;
         assert!(
             (ratio - 1.5).abs() < 0.05,
@@ -1881,19 +1855,12 @@ pub fn verify(req: &HttpRequest) -> Result<Claims, Error> {
         );
     }
     #[test]
-    fn compress_output_never_exceeds_payload_limit() {
+    fn compress_output_fits_codex_high() {
         let png = make_noisy_png(4096, 3072);
-        match compress_image_for_conversation(png, "image/png".into()) {
-            Ok((buf, mime)) => {
-                assert_eq!(mime, "image/jpeg");
-                let b64_len = (buf.len() * 4).div_ceil(3);
-                assert!(
-                    b64_len <= MAX_IMAGE_PAYLOAD_BYTES,
-                    "JPEG output ({b64_len} B b64) must fit within {MAX_IMAGE_PAYLOAD_BYTES} B"
-                );
-            }
-            Err(_) => {}
-        }
+        let (buf, mime) = compress_image_for_conversation(png, "image/png".into()).unwrap();
+        assert_eq!(mime, "image/png");
+        let decoded = image::load_from_memory(&buf).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1824, 1368));
     }
     /// Wrapper-level user-visible message: prefix matches the caller's
     /// `"Could not embed image in conversation: ..."` and the legacy

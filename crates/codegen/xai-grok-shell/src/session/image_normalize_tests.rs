@@ -1,6 +1,14 @@
 use super::*;
 use image::DynamicImage;
 use image::codecs::jpeg::JpegEncoder;
+use bytes::Bytes;
+use std::borrow::Cow;
+use xai_grok_tools::util::image_compress::{
+    HIGH_DETAIL_LIMITS, HIGH_MAX_DIMENSION, prompt_image_dimensions_fit,
+};
+/// Codex `HIGH_DETAIL_LIMITS` (2048 / 2500 patches of 32×32) applied to
+/// `codex-rs/utils/image/src/lib.rs` `prompt_image_output_dimensions_for_limits`.
+/// 2048×2048 → 1600×1600 is pinned by Codex `image_preparation_tests.rs`.
 fn fresh_cache() -> NormalizeCache {
     let cache = NormalizeCache::with_capacity(64 * 1024 * 1024);
     cache.set_enabled(true);
@@ -86,6 +94,18 @@ async fn small_image_unchanged() {
         other => panic!("expected Unchanged, got {other:?}"),
     }
 }
+/// Codex `image_preparation_tests.rs` High: 2048×2048 → 1600×1600.
+#[tokio::test]
+async fn high_detail_2048_square_matches_codex() {
+    let img = make_image_content(2048, 2048);
+    let cache = fresh_cache();
+    match normalize_one_in(img, 1, false, &cache).await {
+        Outcome::Compressed { info, .. } => {
+            assert_eq!((info.compressed_width, info.compressed_height), (1600, 1600));
+        }
+        other => panic!("expected Compressed 1600x1600, got {other:?}"),
+    }
+}
 #[tokio::test]
 async fn large_dimensions_resized_when_over_side_limit() {
     let img = make_image_content(3000, 2000);
@@ -93,70 +113,60 @@ async fn large_dimensions_resized_when_over_side_limit() {
     match normalize_one_in(img, 1, false, &cache).await {
         Outcome::Compressed { content, info } => {
             assert_eq!(content.mime_type, "image/png");
-            assert!(info.compressed_bytes < info.original_bytes);
-            assert!(info.compressed_width <= MAX_ENCODE_SIDE_PX);
-            assert!(info.compressed_height <= MAX_ENCODE_SIDE_PX);
-            let area = u64::from(info.compressed_width) * u64::from(info.compressed_height);
-            assert!(area <= MAX_ENCODE_PIXELS, "area {area} over v9 budget");
+            assert_eq!((info.compressed_width, info.compressed_height), (1920, 1280));
+            assert!(prompt_image_dimensions_fit(
+                info.compressed_width,
+                info.compressed_height,
+                HIGH_DETAIL_LIMITS
+            ));
         }
         other => panic!("expected Compressed, got {other:?}"),
     }
 }
-/// A flat 1700x1700 attachment is under the 2000px side clamp but its
-/// 2.89 Mpx area exceeds the v9 pixel budget, so it must be downscaled —
-/// under a side-only cap this passed through unchanged at full resolution.
+/// 1700x1700 fits the 2048 side cap but exceeds Codex high's 2500-patch
+/// budget (same reason 2048x2048 becomes 1600x1600).
 #[tokio::test]
-async fn attachment_over_area_cap_is_downscaled() {
+async fn attachment_over_patch_cap_is_downscaled() {
     let img = make_image_content(1700, 1700);
     let cache = fresh_cache();
     match normalize_one_in(img, 1, false, &cache).await {
         Outcome::Compressed { info, .. } => {
-            assert!(
-                info.exceeded_dimensions,
-                "1700x1700 = 2.89 Mpx exceeds the {MAX_ENCODE_PIXELS} px area cap"
-            );
-            assert!(info.compressed_width <= MAX_ENCODE_SIDE_PX);
-            assert!(info.compressed_height <= MAX_ENCODE_SIDE_PX);
-            let area = u64::from(info.compressed_width) * u64::from(info.compressed_height);
-            assert!(area <= MAX_ENCODE_PIXELS, "area {area} over v9 budget");
+            assert!(info.exceeded_dimensions);
+            assert_eq!((info.compressed_width, info.compressed_height), (1600, 1600));
+            assert!(prompt_image_dimensions_fit(
+                info.compressed_width,
+                info.compressed_height,
+                HIGH_DETAIL_LIMITS
+            ));
         }
-        other => panic!("expected a 2.89 Mpx image to be downscaled, got {other:?}"),
+        other => panic!("expected a 1700x1700 image to be downscaled, got {other:?}"),
     }
 }
-/// 3438x1830 flat screenshot: aspect > ~1.67, so the 2000px side clamp
-/// binds before the area cap and the long side lands exactly on 2000.
+/// 3438x1830 screenshot: Codex high lands on 2048 long side (patch budget
+/// still fits after the side clamp).
 #[tokio::test]
-async fn wide_screenshot_clamped_to_side_limit_and_area_budget() {
+async fn wide_screenshot_clamped_to_high_detail() {
     let img = make_image_content(3438, 1830);
     let cache = fresh_cache();
     match normalize_one_in(img, 1, false, &cache).await {
         Outcome::Compressed { info, .. } => {
             assert!(info.exceeded_dimensions);
             assert!(!info.exceeded_size, "flat PNG must be small in bytes");
-            assert_eq!(
-                info.compressed_width.max(info.compressed_height),
-                MAX_ENCODE_SIDE_PX,
-                "long side must land on the 2000px compat clamp"
-            );
-            let area = u64::from(info.compressed_width) * u64::from(info.compressed_height);
-            assert!(area <= MAX_ENCODE_PIXELS, "area {area} over v9 budget");
+            assert_eq!((info.compressed_width, info.compressed_height), (2048, 1090));
+            assert_eq!(info.compressed_width, HIGH_MAX_DIMENSION);
         }
         other => panic!("expected Compressed, got {other:?}"),
     }
 }
-/// Near-square 1800x1700 = 3.06 Mpx: sides are within the 2000px clamp,
-/// so only the v9 area cap triggers; the result stays under 2000 per side.
+/// Near-square 1800x1700: sides under 2048, patch budget binds.
 #[tokio::test]
-async fn near_square_over_area_budget_downscaled_below_side_clamp() {
+async fn near_square_over_patch_budget_downscaled() {
     let img = make_image_content(1800, 1700);
     let cache = fresh_cache();
     match normalize_one_in(img, 1, false, &cache).await {
         Outcome::Compressed { info, .. } => {
             assert!(info.exceeded_dimensions);
-            assert!(info.compressed_width < MAX_ENCODE_SIDE_PX);
-            assert!(info.compressed_height < MAX_ENCODE_SIDE_PX);
-            let area = u64::from(info.compressed_width) * u64::from(info.compressed_height);
-            assert!(area <= MAX_ENCODE_PIXELS, "area {area} over v9 budget");
+            assert_eq!((info.compressed_width, info.compressed_height), (1626, 1536));
             let r_in = 1800.0 / 1700.0;
             let r_out = info.compressed_width as f64 / info.compressed_height as f64;
             assert!(
@@ -236,12 +246,11 @@ async fn oversize_bytes_becomes_jpeg_under_limit() {
     match normalize_one_in(img, 1, false, &cache).await {
         Outcome::Compressed { content, info } => {
             assert_eq!(content.mime_type, "image/jpeg");
-            assert!(info.compressed_bytes <= MAX_IMAGE_BYTES);
-            assert!(info.compressed_bytes < info.original_bytes);
-            assert!(info.compressed_width <= MAX_ENCODE_SIDE_PX);
-            assert!(info.compressed_height <= MAX_ENCODE_SIDE_PX);
-            let area = u64::from(info.compressed_width) * u64::from(info.compressed_height);
-            assert!(area <= MAX_ENCODE_PIXELS, "area {area} over v9 budget");
+            assert!(prompt_image_dimensions_fit(
+                info.compressed_width,
+                info.compressed_height,
+                HIGH_DETAIL_LIMITS
+            ));
         }
         other => panic!("expected Compressed, got {other:?}"),
     }
@@ -355,10 +364,11 @@ async fn oversize_wide_image_keeps_aspect_ratio() {
                 info.compressed_height
             );
             assert_ne!(info.compressed_width, info.compressed_height);
-            assert!(info.compressed_width <= MAX_ENCODE_SIDE_PX);
-            assert!(info.compressed_height <= MAX_ENCODE_SIDE_PX);
-            let area = u64::from(info.compressed_width) * u64::from(info.compressed_height);
-            assert!(area <= MAX_ENCODE_PIXELS, "area {area} over v9 budget");
+            assert!(prompt_image_dimensions_fit(
+                info.compressed_width,
+                info.compressed_height,
+                HIGH_DETAIL_LIMITS
+            ));
         }
         other => panic!("expected Compressed, got {other:?}"),
     }
@@ -813,10 +823,9 @@ fn image_dropped_notice_picks_tag_per_harness() {
     assert!(grok.contains("Image 5"));
     assert_eq!(render_image_dropped_notice(&[], false), "");
 }
-/// Large flat-color images compress better as PNG than JPEG; the
-/// normalizer must pick PNG when it wins.
+/// Large flat-color images stay PNG after Codex high resize.
 #[tokio::test]
-async fn flat_color_oversized_picks_png() {
+async fn flat_color_over_high_detail_stays_png() {
     use image::{ImageBuffer, Rgb};
     let side = 4000u32;
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
@@ -827,9 +836,6 @@ async fn flat_color_oversized_picks_png() {
         image::ImageFormat::Png,
     )
     .unwrap();
-    let padding = MAX_IMAGE_BYTES + 1 - png_buf.len();
-    png_buf.resize(png_buf.len() + padding, 0xAA);
-    assert!(png_buf.len() > MAX_IMAGE_BYTES);
     let content = ImageContent::new(
         base64::engine::general_purpose::STANDARD.encode(&png_buf),
         "image/png",
@@ -837,12 +843,8 @@ async fn flat_color_oversized_picks_png() {
     let cache = fresh_cache();
     match normalize_one_in(content, 1, false, &cache).await {
         Outcome::Compressed { content, info } => {
-            assert_eq!(
-                content.mime_type, "image/png",
-                "flat-color image should pick PNG over JPEG"
-            );
-            assert!(info.compressed_bytes <= MAX_IMAGE_BYTES);
-            assert!(info.compressed_bytes < info.original_bytes);
+            assert_eq!(content.mime_type, "image/png");
+            assert_eq!((info.compressed_width, info.compressed_height), (1600, 1600));
         }
         other => panic!("expected Compressed, got {other:?}"),
     }
@@ -887,24 +889,16 @@ async fn normalize_one_in_uses_cache_for_repeat_input() {
     };
     assert_eq!(p1, p2, "`Bytes::as_ptr` identity proves cache hit");
 }
-/// Forces `re_encode_under_limit` to exhaust every step (drives
-/// the `ReEncodingOversized` path).
-static UNSATISFIABLE_PARAMS: ReEncodeParams = ReEncodeParams {
-    max_bytes: 0,
-    max_side_px: MAX_ENCODE_SIDE_PX,
-    max_pixels: MAX_ENCODE_PIXELS,
-    min_side_px: MIN_ENCODE_SIDE_PX,
-    quality_steps: JPEG_QUALITY_STEPS,
-    filter: DOWNSCALE_FILTER,
-};
-fn unsatisfiable_params() -> &'static ReEncodeParams {
-    &UNSATISFIABLE_PARAMS
-}
+/// Encode failure still routes as passthrough + fallback notice
+/// (`NormalizedEntry::ReEncodingOversized`). Prompt-image high has no
+/// byte ladder to exhaust, so this entry is constructed directly.
 #[tokio::test]
 async fn re_encoding_oversized_routing() {
     let raw = jpeg_larger_than_limit();
-    let entry = compute_normalized_blocking(raw.clone(), unsatisfiable_params(), 5)
-        .expect("blocking compute ok");
+    let entry = NormalizedEntry::ReEncodingOversized {
+        bytes: Bytes::from(raw.clone()),
+        mime: Cow::Borrowed("image/jpeg"),
+    };
     match &entry {
         NormalizedEntry::ReEncodingOversized { bytes, mime } => {
             assert_eq!(bytes.as_ref(), raw.as_slice(), "original bytes preserved");
@@ -928,12 +922,17 @@ async fn re_encoding_oversized_routing() {
 async fn re_encoding_oversized_round_trips_through_cache() {
     let raw = jpeg_larger_than_limit();
     let cache = fresh_cache();
-    let params = unsatisfiable_params();
+    let seed = raw.clone();
     cache
         .get_or_try_insert_with(
             raw.clone(),
             HarnessVariant::Default,
-            move |bytes| async move { compute_normalized_blocking(bytes, params, 1) },
+            move |_bytes| async move {
+                Ok(NormalizedEntry::ReEncodingOversized {
+                    bytes: Bytes::from(seed),
+                    mime: Cow::Borrowed("image/jpeg"),
+                })
+            },
         )
         .await
         .expect("seed cache");
@@ -970,12 +969,17 @@ async fn re_encoding_oversized_round_trips_through_cache() {
 async fn normalize_images_in_collects_re_encode_fallback_note() {
     let raw = jpeg_larger_than_limit();
     let cache = fresh_cache();
-    let params = unsatisfiable_params();
+    let seed = raw.clone();
     cache
         .get_or_try_insert_with(
             raw.clone(),
             HarnessVariant::Default,
-            move |bytes| async move { compute_normalized_blocking(bytes, params, 1) },
+            move |_bytes| async move {
+                Ok(NormalizedEntry::ReEncodingOversized {
+                    bytes: Bytes::from(seed),
+                    mime: Cow::Borrowed("image/jpeg"),
+                })
+            },
         )
         .await
         .expect("seed cache");

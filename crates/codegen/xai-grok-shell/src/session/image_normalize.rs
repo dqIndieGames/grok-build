@@ -1,8 +1,5 @@
-//! Re-encode decoded attachments that exceed [`MAX_IMAGE_BYTES`],
-//! [`MAX_ENCODE_PIXELS`], or [`MAX_ENCODE_SIDE_PX`] to fit the conversation
-//! caps. The primary dimension limit is the v9 pixel-area budget
-//! ([`MAX_ENCODE_PIXELS`]); [`MAX_ENCODE_SIDE_PX`] is a model-agnostic side
-//! clamp. Compute is amortised via
+//! Prepare user-attachment images for the coding model using Codex `high`
+//! limits (2048 long side, 2500 vision patches). Compute is amortised via
 //! [`NormalizeCache`](crate::session::normalize_cache).
 use crate::session::normalize_cache::{
     HarnessVariant, NormalizeCache, NormalizeError, NormalizedEntry, run_blocking,
@@ -12,34 +9,20 @@ use base64::Engine as _;
 use bytes::Bytes;
 use std::borrow::Cow;
 use xai_grok_tools::util::format_bytes;
-use xai_grok_tools::util::image_compress::{FilterType, ReEncodeParams, re_encode_under_limit};
-/// Decoded attachment bytes above this are re-encoded to fit this cap.
-///
-/// Kept low so many images fit under the inference proxy's ~50 MB request-body
-/// limit before byte-budget image eviction has to kick in downstream. Base64
-/// inflates raw bytes by ~4/3, so a 1.5 MB image is ~2 MB on the wire and ~25
-/// fit under the limit. A low per-image cost means a conversation rarely
-/// reaches the eviction threshold, so the server-side KV-cache prefix is rarely
-/// rewritten. (Was 5 MB, which let only ~7 images reach the limit and then
-/// forced cache-busting eviction on essentially every subsequent turn.)
+use xai_grok_tools::util::image_compress::{
+    HIGH_DETAIL_LIMITS, MAX_PROMPT_IMAGE_INPUT_BYTES, PromptImageResizeLimits,
+    STRICT_DETAIL_LIMITS, preferred_prompt_format, prompt_image_dimensions_fit,
+    resize_and_encode_prompt_image,
+};
+/// Legacy notice label only — not a send-time byte gate. Codex `high` does not
+/// re-encode just to fit 1.5 MB; conversation-level ~50 MB eviction remains.
 pub(crate) const MAX_IMAGE_BYTES: usize = 1_500_000;
 /// The attachment cap rendered the way the sizes beside it render.
 fn limit_label() -> String {
     format_bytes(MAX_IMAGE_BYTES as u64)
 }
-/// Total pixel budget (w*h) before downscaling. Mirrors the v9 tokenizer's
-/// `image_filter_max_pixels = 2_408_448` — larger images are downsampled
-/// server-side anyway, so extra pixels only waste request bytes.
-const MAX_ENCODE_PIXELS: u64 = 2_408_448;
-/// Max width/height before downscaling. Model-agnostic side clamp because
-/// images are normalized once at ingest and models can switch mid-session.
-/// Not a v9 constraint — [`MAX_ENCODE_PIXELS`] is what the v9 encoder enforces.
-const MAX_ENCODE_SIDE_PX: u32 = 2000;
 /// External-harness image-resize path caps at 1024px before captioning.
 const STRICT_MAX_ENCODE_SIDE_PX: u32 = 1024;
-const MIN_ENCODE_SIDE_PX: u32 = 512;
-const DOWNSCALE_FILTER: FilterType = FilterType::CatmullRom;
-const JPEG_QUALITY_STEPS: &[u8] = &[88, 80, 72, 64, 56, 48, 40, 32];
 /// Upper bound on decoded pixel count before refusing to decode. Matches
 /// the API ceiling ([`MAX_VISION_TOTAL_PX`]) so any image the API would
 /// accept can be decoded for the downscale re-encode — a 20-48 Mpx camera
@@ -61,23 +44,6 @@ pub(crate) const MIN_VISION_TOTAL_PX: u64 = 512;
 /// any resize. Send paths re-encode far below this; only legacy/foreign
 /// history payloads can exceed it.
 pub(crate) const MAX_VISION_TOTAL_PX: u64 = 178_956_970;
-const NORMALIZE_PARAMS: ReEncodeParams = ReEncodeParams {
-    max_bytes: MAX_IMAGE_BYTES,
-    max_side_px: MAX_ENCODE_SIDE_PX,
-    max_pixels: MAX_ENCODE_PIXELS,
-    min_side_px: MIN_ENCODE_SIDE_PX,
-    quality_steps: JPEG_QUALITY_STEPS,
-    filter: DOWNSCALE_FILTER,
-};
-/// Resize target for the stricter image normalization path.
-const STRICT_NORMALIZE_PARAMS: ReEncodeParams = ReEncodeParams {
-    max_bytes: MAX_IMAGE_BYTES,
-    max_side_px: STRICT_MAX_ENCODE_SIDE_PX,
-    max_pixels: u64::MAX,
-    min_side_px: MIN_ENCODE_SIDE_PX,
-    quality_steps: JPEG_QUALITY_STEPS,
-    filter: DOWNSCALE_FILTER,
-};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ImageCompressionInfo {
     pub index: usize,
@@ -180,10 +146,10 @@ pub(crate) async fn normalize_images_in(
         dropped,
     }
 }
-fn params_for(harness: HarnessVariant) -> &'static ReEncodeParams {
+fn limits_for(harness: HarnessVariant) -> PromptImageResizeLimits {
     match harness {
-        HarnessVariant::Cursor => &STRICT_NORMALIZE_PARAMS,
-        HarnessVariant::Default => &NORMALIZE_PARAMS,
+        HarnessVariant::Cursor => STRICT_DETAIL_LIMITS,
+        HarnessVariant::Default => HIGH_DETAIL_LIMITS,
     }
 }
 /// Resolve the active reminder tag via the canonical constants in
@@ -417,18 +383,21 @@ async fn compute_normalized(
     harness: HarnessVariant,
     index: usize,
 ) -> Result<NormalizedEntry, NormalizeError> {
-    let params = params_for(harness);
-    run_blocking(move || compute_normalized_blocking(raw_bytes, params, index)).await
+    let limits = limits_for(harness);
+    run_blocking(move || compute_normalized_blocking(raw_bytes, limits, index)).await
 }
-/// CPU-bound normalize work. `params` widens to `&'static
-/// ReEncodeParams` (instead of `HarnessVariant`) so tests can inject
-/// `max_bytes = 0` to drive the `ReEncodingOversized` branch.
+/// CPU-bound normalize work.
 fn compute_normalized_blocking(
     raw_bytes: Vec<u8>,
-    params: &'static ReEncodeParams,
+    limits: PromptImageResizeLimits,
     index: usize,
 ) -> Result<NormalizedEntry, NormalizeError> {
     let original_bytes = raw_bytes.len();
+    if original_bytes > MAX_PROMPT_IMAGE_INPUT_BYTES {
+        return Err(NormalizeError(format!(
+            "image input is too large ({original_bytes} bytes; max {MAX_PROMPT_IMAGE_INPUT_BYTES} bytes)"
+        )));
+    }
     let (orig_w, orig_h, orig_mime) =
         xai_grok_tools::util::image_validate::validate_image_bytes_with(&raw_bytes, false)
             .map_err(|e| NormalizeError(format!("validate: {e}")))?;
@@ -448,9 +417,8 @@ fn compute_normalized_blocking(
             "too small ({orig_w}×{orig_h} = {pixels} px); images must have at least {MIN_VISION_TOTAL_PX} total pixels"
         )));
     }
-    let exceeded_size = original_bytes > MAX_IMAGE_BYTES;
-    let exceeded_dimensions = params.exceeds_dimension_caps(orig_w, orig_h);
-    if !exceeded_size && !exceeded_dimensions {
+    let exceeded_dimensions = !prompt_image_dimensions_fit(orig_w, orig_h, limits);
+    if !exceeded_dimensions {
         if let Err(e) = xai_grok_tools::util::image_validate::validate_image_bytes(&raw_bytes) {
             return Err(NormalizeError(format!("integrity check failed: {e}")));
         }
@@ -466,27 +434,23 @@ fn compute_normalized_blocking(
     }
     let decoded =
         image::load_from_memory(&raw_bytes).map_err(|e| NormalizeError(format!("decode: {e}")))?;
-    let (buf, new_w, new_h, mime) = match re_encode_under_limit(&decoded, params) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                index,
-                bytes = original_bytes,
-                error = %e,
-                "image re-encode failed; keeping original attachment"
-            );
-            return Ok(NormalizedEntry::ReEncodingOversized {
-                bytes: Bytes::from(raw_bytes),
-                mime: Cow::Borrowed(orig_mime),
-            });
-        }
-    };
-    if buf.len() >= original_bytes {
-        return Ok(NormalizedEntry::Unchanged {
-            bytes: Bytes::from(raw_bytes),
-            mime: Cow::Borrowed(orig_mime),
-        });
-    }
+    let preferred = preferred_prompt_format(&raw_bytes);
+    let (buf, new_w, new_h, mime) =
+        match resize_and_encode_prompt_image(&decoded, preferred, limits) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    index,
+                    bytes = original_bytes,
+                    error = %e,
+                    "image re-encode failed; keeping original attachment"
+                );
+                return Ok(NormalizedEntry::ReEncodingOversized {
+                    bytes: Bytes::from(raw_bytes),
+                    mime: Cow::Borrowed(orig_mime),
+                });
+            }
+        };
     let compressed_bytes = buf.len();
     Ok(NormalizedEntry::Compressed {
         bytes: Bytes::from(buf),
@@ -499,7 +463,7 @@ fn compute_normalized_blocking(
             original_height: orig_h,
             compressed_width: new_w,
             compressed_height: new_h,
-            exceeded_size,
+            exceeded_size: false,
             exceeded_dimensions,
         },
     })

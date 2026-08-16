@@ -42,6 +42,12 @@ jobs:
       - name: Sampler unit tests
         run: cargo test -p xai-grok-sampler --lib
 
+      - name: Prompt-image Codex-high tests
+        run: |
+          cargo test -p xai-grok-tools --lib util::image_compress
+          cargo test -p xai-grok-tools --lib implementations::read_file::image
+          cargo test -p xai-grok-shell --lib session::image_normalize
+
       - name: Release binary
         run: cargo build -p xai-grok-pager-bin --release
 

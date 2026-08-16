@@ -1,12 +1,13 @@
-//! Shared image re-encoding with PNG+JPEG format selection.
+//! Shared image encoding for the coding-model send path and Imagine.
 //!
-//! Both the user-attachment normalizer (`xai-grok-shell`) and the `read_file`
-//! tool image path use this to compress images under a byte-size cap while
-//! respecting per-caller dimension and quality parameters.
+//! Prompt images (paste / `read_file`) use Codex `high` limits via
+//! [`resize_and_encode_prompt_image`]. Imagine (`image_edit`) still uses
+//! [`re_encode_under_limit`] with a per-image byte cap.
 
 use std::borrow::Cow;
 
 use image::DynamicImage;
+use image::ImageFormat;
 use image::codecs::jpeg::JpegEncoder;
 pub use image::imageops::FilterType;
 
@@ -48,6 +49,151 @@ impl ReEncodeParams {
     }
 }
 
+/// Vision-token patch size used by Codex / OpenAI Responses image math.
+pub const PROMPT_IMAGE_PATCH_SIZE: u32 = 32;
+/// Codex `detail: high` longest-side cap.
+pub const HIGH_MAX_DIMENSION: u32 = 2048;
+/// Codex `detail: high` patch-count cap (`ceil(w/32) * ceil(h/32)`).
+pub const HIGH_MAX_PATCHES: usize = 2_500;
+/// Sanity guard against pathological inputs, matching Codex
+/// `MAX_PROMPT_IMAGE_INPUT_BYTES`. Not a target upload size.
+pub const MAX_PROMPT_IMAGE_INPUT_BYTES: usize = 1024 * 1024 * 1024;
+const PROMPT_JPEG_QUALITY: u8 = 85;
+const PROMPT_RESIZE_FILTER: FilterType = FilterType::Triangle;
+
+/// Dimension + patch budget for images sent to the coding model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PromptImageResizeLimits {
+    pub max_dimension: u32,
+    pub max_patches: usize,
+}
+
+/// Codex `HIGH_DETAIL_LIMITS` (image_preparation.rs).
+pub const HIGH_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
+    max_dimension: HIGH_MAX_DIMENSION,
+    max_patches: HIGH_MAX_PATCHES,
+};
+
+/// Cursor-harness side-only clamp: 1024px, no patch budget.
+pub const STRICT_DETAIL_LIMITS: PromptImageResizeLimits = PromptImageResizeLimits {
+    max_dimension: 1024,
+    max_patches: usize::MAX,
+};
+
+/// True when `width`×`height` already fit `limits` (Codex `prompt_image_dimensions_fit`).
+pub fn prompt_image_dimensions_fit(
+    width: u32,
+    height: u32,
+    limits: PromptImageResizeLimits,
+) -> bool {
+    let patches_wide = width.div_ceil(PROMPT_IMAGE_PATCH_SIZE);
+    let patches_high = height.div_ceil(PROMPT_IMAGE_PATCH_SIZE);
+    let patch_count = u64::from(patches_wide) * u64::from(patches_high);
+    width <= limits.max_dimension
+        && height <= limits.max_dimension
+        && patch_count <= limits.max_patches as u64
+}
+
+/// Target width/height under Codex `prompt_image_output_dimensions_for_limits`.
+/// Never upscales.
+pub fn prompt_image_output_dimensions(
+    width: u32,
+    height: u32,
+    limits: PromptImageResizeLimits,
+) -> (u32, u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    if prompt_image_dimensions_fit(width, height, limits) {
+        return (width, height);
+    }
+
+    let max_dimension_scale =
+        (f64::from(limits.max_dimension) / f64::from(width.max(height))).min(1.0);
+    let width = ((f64::from(width) * max_dimension_scale).round() as u32).max(1);
+    let height = ((f64::from(height) * max_dimension_scale).round() as u32).max(1);
+    if prompt_image_dimensions_fit(width, height, limits) {
+        return (width, height);
+    }
+
+    let width_f64 = f64::from(width);
+    let height_f64 = f64::from(height);
+    let patch_size = f64::from(PROMPT_IMAGE_PATCH_SIZE);
+    let mut scale =
+        (patch_size * patch_size * limits.max_patches as f64 / width_f64 / height_f64).sqrt();
+    let scaled_patches_wide = width_f64 * scale / patch_size;
+    let scaled_patches_high = height_f64 * scale / patch_size;
+    scale *= (scaled_patches_wide.floor() / scaled_patches_wide)
+        .min(scaled_patches_high.floor() / scaled_patches_high);
+
+    (
+        ((width_f64 * scale).floor() as u32).max(1),
+        ((height_f64 * scale).floor() as u32).max(1),
+    )
+}
+
+/// Prefer keeping JPEG/WebP when those are the source; everything else becomes PNG.
+pub fn preferred_prompt_format(bytes: &[u8]) -> ImageFormat {
+    match image::guess_format(bytes) {
+        Ok(ImageFormat::Jpeg) => ImageFormat::Jpeg,
+        Ok(ImageFormat::WebP) => ImageFormat::WebP,
+        _ => ImageFormat::Png,
+    }
+}
+
+fn encode_prompt_image(
+    image: &DynamicImage,
+    preferred: ImageFormat,
+) -> Result<(Vec<u8>, &'static str), ReEncodeError> {
+    let target = match preferred {
+        ImageFormat::Jpeg => ImageFormat::Jpeg,
+        ImageFormat::WebP => ImageFormat::WebP,
+        _ => ImageFormat::Png,
+    };
+    let mut buffer = Vec::new();
+    match target {
+        ImageFormat::Jpeg => {
+            let mut enc = JpegEncoder::new_with_quality(&mut buffer, PROMPT_JPEG_QUALITY);
+            enc.encode_image(image).map_err(|_| ReEncodeError::EncodeFailed)?;
+        }
+        ImageFormat::WebP => {
+            image
+                .write_to(&mut std::io::Cursor::new(&mut buffer), ImageFormat::WebP)
+                .map_err(|_| ReEncodeError::EncodeFailed)?;
+        }
+        _ => {
+            image
+                .write_to(&mut std::io::Cursor::new(&mut buffer), ImageFormat::Png)
+                .map_err(|_| ReEncodeError::EncodeFailed)?;
+        }
+    }
+    let mime = match target {
+        ImageFormat::Jpeg => "image/jpeg",
+        ImageFormat::WebP => "image/webp",
+        _ => "image/png",
+    };
+    Ok((buffer, mime))
+}
+
+/// Resize to the Codex budget (if needed) and re-encode. No per-image byte target:
+/// quality is fixed at JPEG 85 / PNG / WebP. Callers that already fit should
+/// pass through original bytes instead of calling this.
+pub fn resize_and_encode_prompt_image(
+    decoded: &DynamicImage,
+    preferred: ImageFormat,
+    limits: PromptImageResizeLimits,
+) -> Result<(Vec<u8>, u32, u32, &'static str), ReEncodeError> {
+    let (target_w, target_h) =
+        prompt_image_output_dimensions(decoded.width(), decoded.height(), limits);
+    let scaled: Cow<'_, DynamicImage> =
+        if target_w == decoded.width() && target_h == decoded.height() {
+            Cow::Borrowed(decoded)
+        } else {
+            Cow::Owned(decoded.resize_exact(target_w, target_h, PROMPT_RESIZE_FILTER))
+        };
+    let (bytes, mime) = encode_prompt_image(&scaled, preferred)?;
+    Ok((bytes, target_w, target_h, mime))
+}
+
 /// Why `re_encode_under_limit` could not produce a compliant output.
 #[derive(Debug, thiserror::Error)]
 pub enum ReEncodeError {
@@ -56,6 +202,9 @@ pub enum ReEncodeError {
         "re-encode could not fit under {max_bytes} bytes after PNG+JPEG attempts (last side {last_side}px)"
     )]
     CouldNotFit { max_bytes: usize, last_side: u32 },
+    /// Prompt-image PNG/JPEG/WebP encode failed.
+    #[error("prompt image encode failed")]
+    EncodeFailed,
 }
 
 /// Try PNG and JPEG encodings at descending dimensions, returning whichever
@@ -282,5 +431,59 @@ mod tests {
                 "{sw}x{sh} cap {cap}: long side must match the predicted fit"
             );
         }
+    }
+
+    // Ground truth: Codex
+    // `codex-rs/utils/image/src/image_tests.rs`
+    // `resize_with_limits_respects_dimension_and_patch_budgets`
+    // and `codex-rs/core/src/image_preparation_tests.rs`
+    // `detail_policies_apply_the_expected_budgets` (High, 2048x2048 → 1600x1600).
+    #[test]
+    fn high_detail_2048_square_matches_codex() {
+        assert_eq!(
+            prompt_image_output_dimensions(2048, 2048, HIGH_DETAIL_LIMITS),
+            (1600, 1600)
+        );
+        let img = noise(2048, 2048);
+        let (_bytes, w, h, _mime) =
+            resize_and_encode_prompt_image(&img, ImageFormat::Png, HIGH_DETAIL_LIMITS).unwrap();
+        assert_eq!((w, h), (1600, 1600));
+        assert!(prompt_image_dimensions_fit(w, h, HIGH_DETAIL_LIMITS));
+    }
+
+    #[test]
+    fn high_detail_output_fits_and_never_upscales() {
+        for &(sw, sh) in &[
+            (1500u32, 1500u32),
+            (1600, 600),
+            (3438, 1830),
+            (3000, 2000),
+            (1700, 1700),
+            (1800, 1700),
+            (3840, 2160),
+            (4096, 2048),
+            (1024, 4096),
+        ] {
+            let (w, h) = prompt_image_output_dimensions(sw, sh, HIGH_DETAIL_LIMITS);
+            assert!(
+                prompt_image_dimensions_fit(w, h, HIGH_DETAIL_LIMITS),
+                "{sw}x{sh} -> {w}x{h} must fit high"
+            );
+            assert!(w <= sw && h <= sh, "{sw}x{sh} -> {w}x{h} must not upscale");
+        }
+        assert!(prompt_image_dimensions_fit(1500, 1500, HIGH_DETAIL_LIMITS));
+        assert!(prompt_image_dimensions_fit(1600, 600, HIGH_DETAIL_LIMITS));
+        assert!(!prompt_image_dimensions_fit(2048, 2048, HIGH_DETAIL_LIMITS));
+        assert!(!prompt_image_dimensions_fit(1700, 1700, HIGH_DETAIL_LIMITS));
+    }
+
+    #[test]
+    fn high_detail_preserves_jpeg_mime_when_resizing() {
+        let img = noise(3000, 2000);
+        let (_bytes, w, h, mime) =
+            resize_and_encode_prompt_image(&img, ImageFormat::Jpeg, HIGH_DETAIL_LIMITS).unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert!(prompt_image_dimensions_fit(w, h, HIGH_DETAIL_LIMITS));
+        assert!(w.max(h) <= HIGH_MAX_DIMENSION);
     }
 }

@@ -12,8 +12,13 @@ pub enum CompressImageError {
         limit_pixels: u64,
     },
     /// Lowest quality / smallest dimension still exceeded the byte cap.
+    /// Unused on the Codex-high prompt path (no per-image byte target); kept
+    /// so Imagine / callers matching this variant still compile.
     #[error("compressed image still exceeds the {0}-byte conversation payload cap")]
     PayloadCapExceeded(usize),
+    /// Decoded input exceeded Codex `MAX_PROMPT_IMAGE_INPUT_BYTES`.
+    #[error("image input is too large ({size} bytes; max {limit} bytes)")]
+    InputTooLarge { size: usize, limit: usize },
     /// No recognised magic bytes, or the IO reader failed before header read.
     #[error("image format could not be detected")]
     FormatDetectionFailed,
@@ -22,25 +27,8 @@ pub enum CompressImageError {
     DecodeFailed(String),
 }
 
-/// Max base64 size for an image embedded in the conversation.
+/// Legacy fixture size for garbage-input tests. Not a send-time byte gate.
 pub const MAX_IMAGE_PAYLOAD_BYTES: usize = 768 * 1024;
-
-/// Raw-byte budget derived from [`MAX_IMAGE_PAYLOAD_BYTES`].
-pub(crate) const MAX_IMAGE_RAW_BYTES: usize = MAX_IMAGE_PAYLOAD_BYTES * 3 / 4;
-
-/// Total pixel budget (w*h) for images sent to the model; preserves the old
-/// 1024x1024 square budget as an aspect-agnostic area.
-pub(crate) const MAX_IMAGE_PIXELS: u64 = 1_048_576;
-
-/// Max pixel dimension (width or height) for images sent to the model.
-/// Model-agnostic side clamp; the area cap above is the operative budget.
-pub(crate) const MAX_IMAGE_DIMENSION: u32 = 2000;
-
-/// Floor dimension — re-encode gives up when `max_side` falls to or below this.
-const MIN_IMAGE_DIMENSION: u32 = 128;
-
-/// JPEG quality ladder for the read-file image compression path.
-const READFILE_QUALITY_STEPS: &[u8] = &[85, 70, 50, 40];
 
 /// Absolute upper bound on decoded pixel count before we refuse to decode.
 /// Matches the model API's `MAX_IMAGE_PIXELS` ceiling (and the shell's
@@ -49,18 +37,14 @@ const READFILE_QUALITY_STEPS: &[u8] = &[85, 70, 50, 40];
 /// above this are rejected by the API regardless.
 const MAX_DECODE_PIXELS: u64 = 178_956_970;
 
-/// Resize and compress an image so its base64 form stays under
-/// [`MAX_IMAGE_PAYLOAD_BYTES`].
+/// Prepare a disk image for the coding model using Codex `high` limits
+/// (2048 long side, 2500 vision patches). Dimensions that already fit are
+/// passed through as original JPEG/PNG/WebP bytes.
 pub fn compress_image_for_conversation(
     raw_bytes: Vec<u8>,
     original_mime: String,
 ) -> Result<(Vec<u8>, String), CompressImageError> {
-    compress_image_for_conversation_with_caps(
-        raw_bytes,
-        original_mime,
-        MAX_IMAGE_RAW_BYTES,
-        MAX_IMAGE_PAYLOAD_BYTES,
-    )
+    compress_image_for_conversation_high(raw_bytes, original_mime)
 }
 
 /// [`compress_image_for_conversation`] off the async path, mapped to the
@@ -104,17 +88,24 @@ pub async fn image_read_output(
     })
 }
 
-/// Cap-parametrised body — exposed for tests that need to reach the
-/// `PayloadCapExceeded` branch deterministically.
-fn compress_image_for_conversation_with_caps(
+/// Codex-high body: GIF/BMP/TIFF → PNG, then passthrough or Triangle resize.
+fn compress_image_for_conversation_high(
     raw_bytes: Vec<u8>,
     original_mime: String,
-    max_raw_bytes: usize,
-    max_payload_bytes: usize,
 ) -> Result<(Vec<u8>, String), CompressImageError> {
-    use crate::util::image_compress::{FilterType, ReEncodeParams, re_encode_under_limit};
+    use crate::util::image_compress::{
+        HIGH_DETAIL_LIMITS, MAX_PROMPT_IMAGE_INPUT_BYTES, ReEncodeError,
+        preferred_prompt_format, prompt_image_dimensions_fit, resize_and_encode_prompt_image,
+    };
     use image::ImageReader;
     use std::io::Cursor;
+
+    if raw_bytes.len() > MAX_PROMPT_IMAGE_INPUT_BYTES {
+        return Err(CompressImageError::InputTooLarge {
+            size: raw_bytes.len(),
+            limit: MAX_PROMPT_IMAGE_INPUT_BYTES,
+        });
+    }
 
     // Engines only sample JPEG/PNG/WebP; PNG ICO/GIF/BMP/TIFF here. Before the
     // small-image early return so we keep the converted bytes.
@@ -133,23 +124,17 @@ fn compress_image_for_conversation_with_caps(
             None => (raw_bytes, original_mime),
         };
 
-    let params = ReEncodeParams {
-        max_bytes: max_raw_bytes,
-        max_side_px: MAX_IMAGE_DIMENSION,
-        max_pixels: MAX_IMAGE_PIXELS,
-        min_side_px: MIN_IMAGE_DIMENSION,
-        quality_steps: READFILE_QUALITY_STEPS,
-        filter: FilterType::Lanczos3,
-    };
+    if raw_bytes.len() > MAX_PROMPT_IMAGE_INPUT_BYTES {
+        return Err(CompressImageError::InputTooLarge {
+            size: raw_bytes.len(),
+            limit: MAX_PROMPT_IMAGE_INPUT_BYTES,
+        });
+    }
 
-    // An image can be small in bytes yet still too large in pixels (e.g. a
-    // flat-colour UI screenshot). Only skip re-encoding when it is within both
-    // the byte budget and the params' dimension caps.
-    let within_pixel_budget = ImageReader::new(Cursor::new(&raw_bytes))
+    let dims = ImageReader::new(Cursor::new(&raw_bytes))
         .with_guessed_format()
         .ok()
-        .and_then(|r| r.into_dimensions().ok())
-        .is_none_or(|(w, h)| !params.exceeds_dimension_caps(w, h));
+        .and_then(|r| r.into_dimensions().ok());
 
     // Pass through untouched only if the bytes are a structurally complete
     // JPEG/PNG/WebP — the formats the API accepts on the wire. Anything
@@ -165,8 +150,8 @@ fn compress_image_for_conversation_with_caps(
         _ => false,
     };
 
-    if (raw_bytes.len() * 4).div_ceil(3) <= max_payload_bytes
-        && within_pixel_budget
+    if let Some((w, h)) = dims
+        && prompt_image_dimensions_fit(w, h, HIGH_DETAIL_LIMITS)
         && passthrough_sendable
     {
         return Ok((raw_bytes, original_mime));
@@ -214,12 +199,15 @@ fn compress_image_for_conversation_with_caps(
         }
     };
 
-    use crate::util::image_compress::ReEncodeError;
-    let (buf, _w, _h, mime) = match re_encode_under_limit(&img, &params) {
+    let preferred = preferred_prompt_format(&raw_bytes);
+    let (buf, _w, _h, mime) = match resize_and_encode_prompt_image(&img, preferred, HIGH_DETAIL_LIMITS)
+    {
         Ok(v) => v,
-        Err(ReEncodeError::CouldNotFit { .. }) => {
-            tracing::warn!("image re-encode could not fit under payload cap");
-            return Err(CompressImageError::PayloadCapExceeded(max_payload_bytes));
+        Err(ReEncodeError::EncodeFailed | ReEncodeError::CouldNotFit { .. }) => {
+            tracing::warn!("image re-encode failed; cannot embed image");
+            return Err(CompressImageError::DecodeFailed(
+                "prompt image encode failed".into(),
+            ));
         }
     };
 
@@ -309,58 +297,42 @@ mod tests {
     }
 
     #[test]
-    fn compress_large_noisy_image_picks_jpeg() {
+    fn compress_large_noisy_png_stays_png_and_fits_high() {
+        use crate::util::image_compress::{HIGH_DETAIL_LIMITS, prompt_image_dimensions_fit};
         let png = make_noisy_png(2048, 1536);
-        let b64_before = (png.len() * 4).div_ceil(3);
-        assert!(
-            b64_before > MAX_IMAGE_PAYLOAD_BYTES,
-            "test image ({b64_before} B b64) must exceed the payload limit"
-        );
-
         let (result, mime) = compress_image_for_conversation(png, "image/png".into()).unwrap();
-        assert_eq!(mime, "image/jpeg");
-
-        let b64_after = (result.len() * 4).div_ceil(3);
-        assert!(
-            b64_after <= MAX_IMAGE_PAYLOAD_BYTES,
-            "compressed image ({b64_after} B b64) must fit within {MAX_IMAGE_PAYLOAD_BYTES} B"
-        );
-    }
-
-    /// Flat-colour image: huge in pixels, tiny in bytes. It fits the byte
-    /// budget yet exceeds the pixel-area cap, so it must still be downscaled.
-    #[test]
-    fn compress_large_dimensions_small_bytes_downscales() {
-        let png = make_small_png(2048, 2600);
-        let b64_before = (png.len() * 4).div_ceil(3);
-        assert!(
-            b64_before <= MAX_IMAGE_PAYLOAD_BYTES,
-            "fixture ({b64_before} B b64) must be under the byte cap to exercise the pixel gate"
-        );
-
-        let (result, _mime) =
-            compress_image_for_conversation(png, "image/png".into()).expect("downscale succeeds");
-
+        assert_eq!(mime, "image/png");
         let (w, h) = image::ImageReader::new(std::io::Cursor::new(&result))
             .with_guessed_format()
             .unwrap()
             .into_dimensions()
             .unwrap();
-        assert!(
-            w <= MAX_IMAGE_DIMENSION && h <= MAX_IMAGE_DIMENSION,
-            "expected <= {MAX_IMAGE_DIMENSION}px per side, got {w}x{h}"
-        );
-        assert!(
-            u64::from(w) * u64::from(h) <= MAX_IMAGE_PIXELS,
-            "expected <= {MAX_IMAGE_PIXELS} px total, got {w}x{h}"
-        );
+        assert_eq!((w, h), (1824, 1368));
+        assert!(prompt_image_dimensions_fit(w, h, HIGH_DETAIL_LIMITS));
     }
 
-    /// Wide image within the pixel-area budget passes through untouched —
-    /// under the old 1024px side cap this was downscaled for no byte gain.
+    /// Flat-colour image: huge in pixels, tiny in bytes. Codex high still
+    /// downscales (2048×2600 exceeds the side cap).
     #[test]
-    fn compress_wide_image_under_area_budget_passes_through() {
-        // 1600x600 = 0.96 Mpx <= MAX_IMAGE_PIXELS with both sides <= 2000.
+    fn compress_large_dimensions_small_bytes_downscales() {
+        use crate::util::image_compress::{HIGH_DETAIL_LIMITS, prompt_image_dimensions_fit};
+        let png = make_small_png(2048, 2600);
+        let (result, mime) =
+            compress_image_for_conversation(png, "image/png".into()).expect("downscale succeeds");
+        assert_eq!(mime, "image/png");
+        let (w, h) = image::ImageReader::new(std::io::Cursor::new(&result))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        // 2048×2600: side clamp then patch budget → 1408×1787.
+        assert_eq!((w, h), (1408, 1787));
+        assert!(prompt_image_dimensions_fit(w, h, HIGH_DETAIL_LIMITS));
+    }
+
+    /// Wide image within Codex high (1600×600) passes through untouched.
+    #[test]
+    fn compress_wide_image_under_high_budget_passes_through() {
         let png = make_small_png(1600, 600);
         let (result, mime) =
             compress_image_for_conversation(png.clone(), "image/png".into()).unwrap();
@@ -368,10 +340,9 @@ mod tests {
         assert_eq!(mime, "image/png");
     }
 
-    /// A large screenshot read from disk lands within the pixel-area budget
-    /// (~1403x747 for a 3438x1830 source), aspect preserved.
+    /// 3438×1830 screenshot: Codex high lands on 2048×1090.
     #[test]
-    fn compress_screenshot_respects_area_budget() {
+    fn compress_screenshot_matches_codex_high() {
         let png = make_small_png(3438, 1830);
         let (result, _mime) =
             compress_image_for_conversation(png, "image/png".into()).expect("downscale succeeds");
@@ -380,10 +351,7 @@ mod tests {
             .unwrap()
             .into_dimensions()
             .unwrap();
-        assert!(
-            u64::from(w) * u64::from(h) <= MAX_IMAGE_PIXELS,
-            "expected <= {MAX_IMAGE_PIXELS} px total, got {w}x{h}"
-        );
+        assert_eq!((w, h), (2048, 1090));
         let r_in = 3438.0 / 1830.0;
         let r_out = w as f64 / h as f64;
         assert!(
@@ -397,12 +365,14 @@ mod tests {
     /// the API accepts up to ~178.9 Mpx and we downscale before the wire.
     #[test]
     fn compress_camera_sized_photo_succeeds() {
+        use crate::util::image_compress::{HIGH_DETAIL_LIMITS, prompt_image_dimensions_fit};
         let png = make_noisy_png(5000, 5000);
         let (out, mime) = compress_image_for_conversation(png, "image/png".into())
             .expect("25 Mpx photo must compress");
-        assert_eq!(mime, "image/jpeg");
+        assert_eq!(mime, "image/png");
         let (w, h, _) = crate::util::image_validate::validate_image_bytes(&out).unwrap();
-        assert!(u64::from(w) * u64::from(h) <= MAX_IMAGE_PIXELS);
+        assert_eq!((w, h), (1600, 1600));
+        assert!(prompt_image_dimensions_fit(w, h, HIGH_DETAIL_LIMITS));
     }
 
     /// Above the API's own ceiling the decode is refused (the API would 400
@@ -449,19 +419,12 @@ mod tests {
     }
 
     #[test]
-    fn compress_barely_over_limit_succeeds() {
+    fn compress_within_high_budget_passes_through_regardless_of_bytes() {
         let png = make_noisy_png(1400, 1050);
-        let b64_before = (png.len() * 4).div_ceil(3);
-        if b64_before <= MAX_IMAGE_PAYLOAD_BYTES {
-            return;
-        }
-        match compress_image_for_conversation(png, "image/png".into()) {
-            Ok((result, _mime)) => {
-                let b64_after = (result.len() * 4).div_ceil(3);
-                assert!(b64_after <= MAX_IMAGE_PAYLOAD_BYTES);
-            }
-            Err(e) => panic!("expected compression to succeed for barely-over-limit image: {e}"),
-        }
+        let (result, mime) =
+            compress_image_for_conversation(png.clone(), "image/png".into()).unwrap();
+        assert_eq!(result, png, "1400x1050 fits Codex high; no byte re-encode");
+        assert_eq!(mime, "image/png");
     }
 
     /// All-zero bytes → `FormatDetectionFailed`.
@@ -491,6 +454,8 @@ mod tests {
         );
     }
 
+    /// Tiny caps are no longer a prompt-image failure mode. Keep the
+    /// `PayloadCapExceeded` Display pin for callers that still match the variant.
     #[test]
     fn payload_cap_exceeded_display_string_pinned() {
         let cap_err = CompressImageError::PayloadCapExceeded(768 * 1024);
@@ -500,18 +465,21 @@ mod tests {
         );
     }
 
-    /// Tiny caps (~1.4 KB base64) on a 256×256 noise PNG exhaust the
-    /// quality ladder and surface `PayloadCapExceeded`.
     #[test]
-    fn payload_cap_exceeded_reached_through_production_path() {
-        let png = make_noisy_png(256, 256);
-        let err = compress_image_for_conversation_with_caps(png, "image/png".into(), 1024, 1400)
-            .unwrap_err();
-        match err {
-            CompressImageError::PayloadCapExceeded(cap) => {
-                assert_eq!(cap, 1400);
-            }
-            other => panic!("expected PayloadCapExceeded, got {other:?}"),
-        }
+    fn input_too_large_display_pins_codex_one_gib_cap() {
+        use crate::util::image_compress::MAX_PROMPT_IMAGE_INPUT_BYTES;
+        let err = CompressImageError::InputTooLarge {
+            size: MAX_PROMPT_IMAGE_INPUT_BYTES + 1,
+            limit: MAX_PROMPT_IMAGE_INPUT_BYTES,
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&(MAX_PROMPT_IMAGE_INPUT_BYTES + 1).to_string()),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(&MAX_PROMPT_IMAGE_INPUT_BYTES.to_string()),
+            "rendered: {rendered}"
+        );
     }
 }
