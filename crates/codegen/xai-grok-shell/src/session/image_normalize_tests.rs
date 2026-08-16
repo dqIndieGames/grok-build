@@ -1,7 +1,8 @@
 use super::*;
+use base64::Engine as _;
+use bytes::Bytes;
 use image::DynamicImage;
 use image::codecs::jpeg::JpegEncoder;
-use bytes::Bytes;
 use std::borrow::Cow;
 use xai_grok_tools::util::image_compress::{
     HIGH_DETAIL_LIMITS, HIGH_MAX_DIMENSION, prompt_image_dimensions_fit,
