@@ -46,6 +46,7 @@ jobs:
         run: |
           cargo test -p xai-grok-tools --lib util::image_compress
           cargo test -p xai-grok-tools --lib implementations::read_file::image
+          cargo test -p xai-grok-tools --lib implementations::grok_build::image_edit
           cargo test -p xai-grok-shell --lib session::image_normalize
 
       - name: Release binary

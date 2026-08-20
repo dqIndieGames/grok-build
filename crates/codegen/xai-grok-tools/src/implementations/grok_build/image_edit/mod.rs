@@ -6,16 +6,14 @@
 //! tool (instead of `image_gen`) when the user provides reference photos.
 //!
 //! Reference images are specified as filesystem paths or
-//! `data:image/...;base64,...` URLs. The tool reads the bytes, compresses
-//! them to fit API limits, and POSTs to the edit endpoint.
+//! `data:image/...;base64,...` URLs. The tool reads the bytes, prepares
+//! them with the Codex `high` budget (same as paste / `read_file`), and
+//! POSTs to the edit endpoint.
 //!
 //! Shares the same [`ImageGenClient`] and session credentials as
 //! `image_gen` — no additional configuration is needed.
 
-use std::io::Cursor;
-
 use base64::Engine as _;
-use image::ImageReader;
 use reqwest::header::AUTHORIZATION;
 
 use crate::attribution::ToolConsumer;
@@ -24,17 +22,8 @@ use crate::types::output::{MediaGenOutput, ToolOutput};
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::resources::SessionFolder;
 use crate::types::tool::{ToolKind, ToolNamespace};
-use crate::util::image_compress::{FilterType, ReEncodeParams, re_encode_under_limit};
 
 pub(crate) const XAI_IMAGINE_EDIT_MODEL: &str = "grok-imagine-image-quality";
-
-/// Size/dimension limits for reference images sent to the Imagine API.
-/// Tighter than the vision path; the backend returns 400 when exceeded.
-const MAX_REF_RAW_BYTES: usize = 400 * 1024;
-const MAX_REF_DIMENSION: u32 = 768;
-const MIN_REF_DIMENSION: u32 = 256;
-const REF_QUALITY_STEPS: &[u8] = &[80, 65, 50, 35];
-const MAX_REF_DECODE_PIXELS: u64 = 12_000_000;
 
 pub const IMAGE_EDIT_TOOL_NAME: &str = "image_edit";
 
@@ -42,67 +31,39 @@ pub const IMAGE_EDIT_TOOL_NAME: &str = "image_edit";
 // Compression
 // ---------------------------------------------------------------------------
 
-/// Compress a reference image to fit within Imagine API limits.
+/// Prepare a reference image with the same Codex `high` budget as paste /
+/// `read_file` (2048 long side, 2500 vision patches). Dimensions that
+/// already fit pass through as original JPEG/PNG/WebP bytes. Live Imagine
+/// `/images/edits` accepted these payloads on 2026-08-21; the old 400 KiB /
+/// 768px gates were client-side only.
 ///
-/// Returns `(bytes, mime)`. Small JPEG/PNG inputs pass through unchanged.
+/// Returns `(bytes, mime)`.
 fn compress_reference(
     raw_bytes: Vec<u8>,
 ) -> Result<(Vec<u8>, &'static str), xai_tool_runtime::ToolError> {
-    // Fast path: small JPEG/PNG passes through unchanged. Other formats
-    // (WebP, GIF, etc.) always re-encode to guarantee API-compatible output.
-    if raw_bytes.len() <= MAX_REF_RAW_BYTES
-        && let Some(kind) = infer::get(&raw_bytes)
-    {
-        match kind.mime_type() {
-            "image/jpeg" => return Ok((raw_bytes, "image/jpeg")),
-            "image/png" => return Ok((raw_bytes, "image/png")),
-            _ => {}
-        }
-    }
-
-    // Refuse to decode absurdly large images.
-    let reader = ImageReader::new(Cursor::new(&raw_bytes))
-        .with_guessed_format()
-        .map_err(|_| {
-            xai_tool_runtime::ToolError::invalid_arguments(
-                "could not detect image format for reference",
-            )
-        })?;
-
-    if let Ok((w, h)) = reader.into_dimensions()
-        && (w as u64) * (h as u64) > MAX_REF_DECODE_PIXELS
-    {
-        return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
-            "image reference is too large to process ({w}\u{00d7}{h} pixels)",
-        )));
-    }
-
-    // `into_dimensions` consumed the reader; re-open to decode.
-    let img = ImageReader::new(Cursor::new(&raw_bytes))
-        .with_guessed_format()
-        .ok()
-        .and_then(|r| r.decode().ok())
-        .ok_or_else(|| {
-            xai_tool_runtime::ToolError::invalid_arguments("failed to decode image reference")
-        })?;
-
-    let params = ReEncodeParams {
-        max_bytes: MAX_REF_RAW_BYTES,
-        max_side_px: MAX_REF_DIMENSION,
-        // Imagine backend limits are side-based; no pixel-area cap applies.
-        max_pixels: u64::MAX,
-        min_side_px: MIN_REF_DIMENSION,
-        quality_steps: REF_QUALITY_STEPS,
-        filter: FilterType::Lanczos3,
-    };
-
-    let (buf, _w, _h, mime) = re_encode_under_limit(&img, &params).map_err(|e| {
+    let original_mime = infer::get(&raw_bytes)
+        .map(|kind| kind.mime_type().to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let (bytes, mime) = crate::implementations::read_file::compress_image_for_conversation(
+        raw_bytes,
+        original_mime,
+    )
+    .map_err(|e| {
         xai_tool_runtime::ToolError::invalid_arguments(format!(
-            "could not compress image reference small enough for Imagine API: {e}"
+            "could not prepare image reference for Imagine API: {e}"
         ))
     })?;
-
-    Ok((buf, mime))
+    let mime = match mime.as_str() {
+        "image/jpeg" => "image/jpeg",
+        "image/png" => "image/png",
+        "image/webp" => "image/webp",
+        other => {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                "unsupported image reference mime after Codex-high prepare: {other}"
+            )));
+        }
+    };
+    Ok((bytes, mime))
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +503,22 @@ mod tests {
         buf
     }
 
+    fn make_solid_png(width: u32, height: u32) -> Vec<u8> {
+        use image::{ImageBuffer, Rgba};
+        let img = ImageBuffer::from_pixel(width, height, Rgba([40u8, 80, 120, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    fn dims(bytes: &[u8]) -> (u32, u32) {
+        image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap()
+    }
+
     #[test]
     fn compress_small_jpeg_passthrough() {
         let jpeg = tiny_jpeg();
@@ -558,8 +535,31 @@ mod tests {
         assert_eq!(mime, "image/png");
     }
 
+    /// Codex High: 2048×2048 → 1600×1600.
+    /// Ground truth: `codex-rs/core/src/image_preparation_tests.rs`
+    /// `detail_policies_apply_the_expected_budgets` (High). Same pin as
+    /// `image_compress::high_detail_2048_square_matches_codex`.
     #[test]
-    fn compress_oversized_shrinks() {
+    fn compress_2048_square_matches_codex_high() {
+        let png = make_solid_png(2048, 2048);
+        let (out, mime) = compress_reference(png).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(dims(&out), (1600, 1600));
+    }
+
+    /// Codex High of 3000×2000 is 1920×1280 (same pin as read_file image tests).
+    #[test]
+    fn compress_3000x2000_matches_codex_high() {
+        let png = make_solid_png(3000, 2000);
+        let (out, mime) = compress_reference(png).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(dims(&out), (1920, 1280));
+    }
+
+    /// 1600×1600 already fits high (50×50 = 2500 patches). The retired 400 KiB
+    /// client gate must not re-encode.
+    #[test]
+    fn compress_1600_over_legacy_400kb_passthrough() {
         use image::{DynamicImage, RgbImage};
         let mut img = RgbImage::new(1600, 1600);
         for (i, px) in img.pixels_mut().enumerate() {
@@ -571,11 +571,15 @@ mod tests {
         DynamicImage::ImageRgb8(img)
             .write_with_encoder(enc)
             .unwrap();
-        assert!(buf.len() > MAX_REF_RAW_BYTES);
-
-        let (out, mime) = compress_reference(buf).unwrap();
-        assert!(out.len() <= MAX_REF_RAW_BYTES);
-        assert!(mime == "image/jpeg" || mime == "image/png");
+        assert!(
+            buf.len() > 400 * 1024,
+            "precondition: fixture must exceed the retired 400 KiB gate, got {}",
+            buf.len()
+        );
+        let (out, mime) = compress_reference(buf.clone()).unwrap();
+        assert_eq!(out, buf, "within-high image must not be re-encoded for bytes");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(dims(&out), (1600, 1600));
     }
 
     // ── resolve_to_data_url ──────────────────────────────────────────

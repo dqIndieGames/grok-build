@@ -1,8 +1,8 @@
 //! Shared image encoding for the coding-model send path and Imagine.
 //!
-//! Prompt images (paste / `read_file`) use Codex `high` limits via
-//! [`resize_and_encode_prompt_image`]. Imagine (`image_edit`) still uses
-//! [`re_encode_under_limit`] with a per-image byte cap.
+//! Prompt images (paste / `read_file` / `image_edit` references) use Codex
+//! `high` limits via [`resize_and_encode_prompt_image`].
+//! [`re_encode_under_limit`] remains a byte-capped encoder for other callers.
 
 use std::borrow::Cow;
 
